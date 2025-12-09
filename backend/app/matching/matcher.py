@@ -1,11 +1,10 @@
 """
 matcher.py
 
-Enhanced matching engine with safeguards:
-- Ignore single-character tokens from user input (A, B, C etc.)
-- IDF-like per-token weighting with clamps
-- Generic token detection & blacklist
-- Require minimum meaningful tokens or exact/strong fuzzy match to be relevant
+Matcher with strict multi-word phrase handling:
+- Multi-word phrases (e.g., "hospital info") must appear whole in the input to get phrase/token credit.
+- Tokens that only appear inside multi-word CSV entries (and are not standalone CSV phrases) are ignored for token scoring.
+- Keeps prior safeguards: IDF-weighting, generic token blacklist, single-char token ignore, single-token cap, fuzzy matching, dynamic denominator.
 
 Save as:
 product_matcher/backend/app/matching/matcher.py
@@ -23,7 +22,7 @@ _MIN_IDF_FACTOR = 0.6
 _MAX_IDF_FACTOR = 3.5
 _MAX_TOKEN_WEIGHT = 10.0
 
-# Safeguard defaults (can be mirrored in config.py if desired)
+# Safeguard defaults (can be mirrored in config.py)
 _MIN_MEANINGFUL_TOKENS_FOR_RELEVANT = getattr(config, "MIN_MEANINGFUL_TOKENS_FOR_RELEVANT", 2)
 _SINGLE_TOKEN_MAX_SCORE = getattr(config, "SINGLE_TOKEN_MAX_SCORE", 10)  # percent
 _GENERIC_TOKEN_FREQ_RATIO = getattr(config, "GENERIC_TOKEN_FREQ_RATIO", 0.30)
@@ -34,23 +33,41 @@ def _is_input_token_valid(tok: str) -> bool:
     """
     Input token validity filter:
     - Exclude tokens shorter than 2 characters (single letters)
-    - Exclude pure numeric tokens (e.g., "2023", "123") as they are usually model numbers
-    - Keep tokens with length >=2 and at least one alphabetic char OR alphanumeric combos like "v2"
+    - Exclude pure numeric tokens
+    - Accept tokens length >=2 and not purely numeric
     """
     if not tok:
         return False
     if len(tok) < 2:
         return False
-    # if token is all digits, reject
     if tok.isdigit():
         return False
-    # otherwise accept
     return True
 
 
 class Matcher:
     def __init__(self, store: KeywordStore):
         self.store = store
+
+        # Build token role sets:
+        # - single_word_tokens: tokens that exist as standalone phrases in the CSV
+        # - multiword_tokens: tokens that appear in at least one multiword phrase
+        single_tokens: Set[str] = set()
+        multi_tokens: Set[str] = set()
+
+        for entry in self.store.all_entries():
+            toks = entry.tokens
+            if not toks:
+                continue
+            if len(toks) == 1:
+                # single-word phrase (e.g., "laser")
+                single_tokens.update(toks)
+            else:
+                # multi-word phrase (e.g., "hospital info")
+                multi_tokens.update(toks)
+
+        self.single_word_tokens: Set[str] = single_tokens
+        self.multiword_tokens: Set[str] = multi_tokens
 
     def analyze(self, text: str, category_filter: str = "all") -> Dict[str, Any]:
         if not text or not text.strip():
@@ -85,7 +102,7 @@ class Matcher:
         cf = (category_filter or "all").strip().lower()
         total_entries = max(1, self.store.size())
 
-        # 1) Exact phrase matches (still use full normalized text)
+        # 1) Exact phrase matches (strong signal)
         for norm_phrase, entry in list(self.store.phrase_map.items()):
             if cf != "all" and entry.category.lower() != cf:
                 continue
@@ -94,8 +111,7 @@ class Matcher:
             if norm_phrase in norm_text:
                 _add_match(entry, "exact", config.EXACT_PHRASE_WEIGHT, entry.phrase)
 
-        # 2) Token-level matches (IDF-weighted)
-        # Build candidate indices only from filtered text_tokens (so single-letter matches won't create candidates)
+        # 2) Token-level matches (IDF-weighted), with multiword-aware token filtering
         candidate_indices: Set[int] = set()
         for tok in text_tokens:
             if tok in self.store.token_index:
@@ -120,18 +136,33 @@ class Matcher:
         for entry in candidate_entries:
             if entry.phrase in matched_phrases:
                 continue
-            # use intersection with filtered tokens only
+            # intersection with filtered tokens only
             overlap = entry.tokens.intersection(text_tokens)
             if overlap:
-                token_weight_sum = 0.0
+                # Apply multiword-aware token filtering:
+                # Keep token t only if either:
+                #  - t is present as a single-word phrase in CSV (self.single_word_tokens), OR
+                #  - t is NOT exclusively part of multiword-only phrases (i.e., not in self.multiword_tokens)
+                allowed_overlap = set()
                 for t in overlap:
+                    if (t in self.single_word_tokens) or (t not in self.multiword_tokens):
+                        allowed_overlap.add(t)
+
+                if not allowed_overlap:
+                    # No allowed tokens (they were only parts of multiword phrases and those full phrases didn't match)
+                    continue
+
+                token_weight_sum = 0.0
+                for t in allowed_overlap:
                     freq = len(self.store.token_index.get(t, []))
                     idf_factor = 1.0 + math.log((total_entries) / (1 + freq)) if freq >= 0 else 1.0
                     idf_factor = max(_MIN_IDF_FACTOR, min(_MAX_IDF_FACTOR, idf_factor))
                     token_weight_sum += config.TOKEN_WEIGHT * idf_factor
+
                 weight = min(token_weight_sum, _MAX_TOKEN_WEIGHT)
-                _add_match(entry, "token", weight, ", ".join(sorted(overlap)))
-                for t in overlap:
+                _add_match(entry, "token", weight, ", ".join(sorted(allowed_overlap)))
+
+                for t in allowed_overlap:
                     if not is_generic_token(t):
                         meaningful_tokens_matched.add(t)
 
@@ -180,8 +211,7 @@ class Matcher:
         max_possible = config.EXACT_PHRASE_WEIGHT * denom_keywords
         score_pct = int(min(100, round(100.0 * raw_score / max(1.0, max_possible))))
 
-        # SAFEGUARD: if only a small number of meaningful tokens matched (excluding single-char tokens),
-        # and no exact/fuzzy_strong match, cap to single-token max and mark not relevant.
+        # SAFEGUARD: single-token or only-generic tokens handling
         has_exact_or_strong = any(m["match_type"] in ("exact", "fuzzy_strong") for m in matches)
         meaningful_count = len(meaningful_tokens_matched)
 
